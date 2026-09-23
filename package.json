@@ -1,0 +1,56 @@
+{
+  "name": "@covennetwork/arb",
+  "version": "0.2.1",
+  "description": "Atomic single-chain arbitrage solver, scanner and CovenArb bindings for Arc.",
+  "license": "MIT",
+  "homepage": "https://coven.network",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run test/unit",
+    "test:fork": "vitest run test/fork"
+  },
+  "dependencies": {
+    "@covennetwork/core": "^0.3.0"
+  },
+  "peerDependencies": {
+    "viem": "^2.56.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.3",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "viem": "^2.56.6",
+    "vitest": "^5.0.1"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "coven-arb": "./dist/cli.js"
+  }
+}
