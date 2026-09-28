@@ -1,6 +1,6 @@
 {
   "name": "@covennetwork/arb",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Atomic single-chain arbitrage solver, scanner and CovenArb bindings for Arc.",
   "license": "MIT",
   "homepage": "https://coven.network",
@@ -30,6 +30,7 @@
   },
   "scripts": {
     "build": "tsup",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run test/unit",
     "test:fork": "vitest run test/fork"
@@ -52,5 +53,8 @@
   },
   "bin": {
     "coven-arb": "./dist/cli.js"
+  },
+  "allowScripts": {
+    "esbuild@0.27.7": true
   }
 }
