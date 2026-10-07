@@ -1,85 +1,89 @@
-// Within-range constant-product model. A Uniswap v3/v4 pool is constant-product over
-// its current tick range with virtual reserves x0 = L/sqrtP, y1 = L*sqrtP. This is the
-// closed form the spec calls for; it is exact while a trade stays inside the current
-// range (the common case for single-position launchpad pools) and a close seed
-// otherwise, refined against the CovenLens oracle by the solver. All amounts are bigint.
+// Off-chain math is only used to decide which cycles are worth asking the chain about and
+// where to centre the size search. The chain decides the actual profit (see probe.ts).
 const Q96 = 2n ** 96n
 const FEE_DEN = 1_000_000n
 
-export type PoolSim = {
-  protocol: 'v3' | 'v4'
+export type Hop = {
   sqrtPriceX96: bigint
   liquidity: bigint
+  // millionths
   fee: number
-  token0: `0x${string}`
-  token1: `0x${string}`
+  zeroForOne: boolean
 }
 
-export function reserves(p: PoolSim): { x0: bigint; y1: bigint } {
-  if (p.sqrtPriceX96 <= 0n || p.liquidity <= 0n) return { x0: 0n, y1: 0n }
-  return { x0: (p.liquidity * Q96) / p.sqrtPriceX96, y1: (p.liquidity * p.sqrtPriceX96) / Q96 }
+// Marginal output per unit input (raw token units) after the LP fee.
+export function spotRate(h: Hop): number {
+  const s = Number(h.sqrtPriceX96) / 2 ** 96
+  const price = s * s // token1 per token0
+  const rate = h.zeroForOne ? price : 1 / price
+  return rate * (1 - h.fee / 1e6)
 }
 
-// exact-input constant-product output with fee (fee is 1e6-based, e.g. 3000 = 0.30%)
+// Edge of a cycle at the margin, in basis points: >0 means an infinitesimal trade profits.
+export function edgeBps(hops: Hop[]): number {
+  let r = 1
+  for (const h of hops) r *= spotRate(h)
+  return (r - 1) * 10_000
+}
+
+// A concentrated-liquidity pool trades like constant product with virtual reserves
+// x = L/sqrtP, y = L*sqrtP while the price stays inside the current tick range.
+export function virtualReserves(h: Hop): { rIn: bigint; rOut: bigint } {
+  if (h.sqrtPriceX96 <= 0n || h.liquidity <= 0n) return { rIn: 0n, rOut: 0n }
+  const x = (h.liquidity * Q96) / h.sqrtPriceX96
+  const y = (h.liquidity * h.sqrtPriceX96) / Q96
+  return h.zeroForOne ? { rIn: x, rOut: y } : { rIn: y, rOut: x }
+}
+
 export function cpmmOut(amountIn: bigint, rIn: bigint, rOut: bigint, fee: number): bigint {
   if (amountIn <= 0n || rIn <= 0n || rOut <= 0n) return 0n
-  const inAfter = (amountIn * (FEE_DEN - BigInt(fee))) / FEE_DEN
-  if (inAfter <= 0n) return 0n
-  return (inAfter * rOut) / (rIn + inAfter)
+  const inAfterFee = (amountIn * (FEE_DEN - BigInt(fee))) / FEE_DEN
+  return (inAfterFee * rOut) / (rIn + inAfterFee)
 }
 
-export type CyclePlan = {
-  usdcIn: bigint
-  tokenMid: bigint
-  usdcOut: bigint
-  grossProfit: bigint
-}
-
-// Buy the shared token with USDC on `buy`, sell it back for USDC on `sell`.
-export function evalCycle(
-  buy: PoolSim,
-  sell: PoolSim,
-  usdcIsToken0OnBuy: boolean,
-  usdcIsToken0OnSell: boolean,
-  usdcIn: bigint,
-): CyclePlan | null {
-  const rb = reserves(buy)
-  const rs = reserves(sell)
-  const buyIn = usdcIsToken0OnBuy ? rb.x0 : rb.y1
-  const buyOut = usdcIsToken0OnBuy ? rb.y1 : rb.x0
-  const sellIn = usdcIsToken0OnSell ? rs.y1 : rs.x0
-  const sellOut = usdcIsToken0OnSell ? rs.x0 : rs.y1
-  if (buyIn <= 0n || buyOut <= 0n || sellIn <= 0n || sellOut <= 0n) return null
-  const mid = cpmmOut(usdcIn, buyIn, buyOut, buy.fee)
-  if (mid <= 0n) return null
-  const out = cpmmOut(mid, sellIn, sellOut, sell.fee)
-  return { usdcIn, tokenMid: mid, usdcOut: out, grossProfit: out - usdcIn }
-}
-
-// Ternary search for the USDC input maximising gross profit. The cycle's profit as a
-// function of input is unimodal (concave), so ternary search converges to the optimum.
-export function optimalCycle(
-  buy: PoolSim,
-  sell: PoolSim,
-  usdcIsToken0OnBuy: boolean,
-  usdcIsToken0OnSell: boolean,
-): CyclePlan | null {
-  const rb = reserves(buy)
-  const buyUsdcReserve = usdcIsToken0OnBuy ? rb.x0 : rb.y1
-  if (buyUsdcReserve < 2n) return null
-  const profit = (x: bigint) => {
-    const c = evalCycle(buy, sell, usdcIsToken0OnBuy, usdcIsToken0OnSell, x)
-    return c ? c.grossProfit : -(1n << 255n)
+export function cycleOut(hops: Hop[], amountIn: bigint): bigint {
+  let amt = amountIn
+  for (const h of hops) {
+    const { rIn, rOut } = virtualReserves(h)
+    amt = cpmmOut(amt, rIn, rOut, h.fee)
+    if (amt <= 0n) return 0n
   }
+  return amt
+}
+
+// Input that maximises out - in under the virtual-reserve model. Profit is concave in the
+// input, so ternary search converges. Returns null when no input is profitable.
+export function optimalInput(hops: Hop[]): { amountIn: bigint; profit: bigint } | null {
+  const first = hops[0]
+  if (!first) return null
+  const cap = virtualReserves(first).rIn
+  if (cap < 2n) return null
+  const profit = (x: bigint) => cycleOut(hops, x) - x
   let lo = 1n
-  let hi = buyUsdcReserve
-  for (let i = 0; i < 256 && hi - lo > 1n; i++) {
+  let hi = cap
+  while (hi - lo > 2n) {
     const m1 = lo + (hi - lo) / 3n
     const m2 = hi - (hi - lo) / 3n
     if (profit(m1) < profit(m2)) lo = m1
     else hi = m2
   }
   let best = lo
-  for (const c of [lo, (lo + hi) / 2n, hi]) if (profit(c) > profit(best)) best = c
-  return evalCycle(buy, sell, usdcIsToken0OnBuy, usdcIsToken0OnSell, best)
+  for (let x = lo; x <= hi; x++) if (profit(x) > profit(best)) best = x
+  const p = profit(best)
+  return p > 0n ? { amountIn: best, profit: p } : null
+}
+
+// Geometric grid of trade sizes around a seed, for one-shot on-chain sizing. The virtual
+// reserve model can be off by an order of magnitude when a trade crosses ticks, so the
+// grid spans seed/32 .. seed*8.
+export function sizeGrid(seed: bigint, points = 16, below = 32, above = 8): bigint[] {
+  if (seed <= 0n) return []
+  const lo = Number(seed) / below
+  const ratio = (above * below) ** (1 / (points - 1))
+  const out = new Set<bigint>()
+  for (let i = 0; i < points; i++) {
+    const v = BigInt(Math.max(1, Math.round(lo * ratio ** i)))
+    out.add(v)
+  }
+  return [...out]
 }

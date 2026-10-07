@@ -1,11 +1,20 @@
 import { defineConfig } from 'tsup'
 
-export default defineConfig({
-  entry: ['src/index.ts', 'src/cli.ts'],
-  format: ['esm', 'cjs'],
-  dts: { entry: 'src/index.ts' },
-  sourcemap: true,
-  clean: true,
-  target: 'es2022',
-  external: ['viem', '@covennetwork/core'],
-})
+export default defineConfig([
+  {
+    entry: ['src/index.ts'],
+    format: ['esm', 'cjs'],
+    dts: true,
+    sourcemap: true,
+    clean: true,
+    target: 'node18',
+    external: ['viem', '@covennetwork/core', '@noble/hashes'],
+  },
+  {
+    entry: ['src/cli.ts'],
+    format: ['esm'],
+    sourcemap: true,
+    target: 'node18',
+    external: ['viem', '@covennetwork/core', '@noble/hashes'],
+  },
+])

@@ -1,10 +1,22 @@
 {
   "name": "@covennetwork/arb",
-  "version": "0.2.2",
-  "description": "Atomic single-chain arbitrage solver, scanner and CovenArb bindings for Arc.",
+  "version": "0.3.0",
+  "description": "Capital-free atomic arbitrage bot and library for Arc: discovers every v3/v4 venue, verifies each cycle on-chain through CovenArb, and races it with a profit-share priority bid.",
   "license": "MIT",
   "homepage": "https://coven.network",
+  "keywords": [
+    "arc",
+    "arbitrage",
+    "mev",
+    "uniswap",
+    "v4",
+    "usdc",
+    "coven"
+  ],
   "type": "module",
+  "bin": {
+    "coven-arb": "./dist/cli.js"
+  },
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -26,17 +38,17 @@
   ],
   "sideEffects": false,
   "engines": {
-    "node": ">=18"
+    "node": ">=18.3"
   },
   "scripts": {
     "build": "tsup",
     "prepublishOnly": "npm run typecheck && npm test && npm run build",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run test/unit",
-    "test:fork": "vitest run test/fork"
+    "test": "vitest run test/unit"
   },
   "dependencies": {
-    "@covennetwork/core": "^0.3.0"
+    "@covennetwork/core": "^0.3.0",
+    "@noble/hashes": "^1.8.0"
   },
   "peerDependencies": {
     "viem": "^2.56.0"
@@ -50,9 +62,6 @@
   },
   "publishConfig": {
     "access": "public"
-  },
-  "bin": {
-    "coven-arb": "./dist/cli.js"
   },
   "allowScripts": {
     "esbuild@0.27.7": true
