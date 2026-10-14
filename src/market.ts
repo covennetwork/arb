@@ -26,6 +26,11 @@ export class Market {
   private unknownV4 = new Map<Hex, { tx: Hex; fee: number }>()
   private needsRefresh = new Set<Hex>()
   private newTokens = new Set<Address>()
+  // Position (block * 1e6 + logIndex) of the newest event applied to each pool's state, so a
+  // late or duplicate event cannot roll a price back.
+  private applied = new Map<Hex, bigint>()
+  // Transactions that swapped two or more tracked pools in a closed loop: other bots' arbs.
+  private arbTxs = new Map<Hex, Hex[]>()
 
   constructor(
     readonly rpc: Rpc,
@@ -75,10 +80,23 @@ export class Market {
   // Apply one batch of logs. Returns the pools whose price moved.
   applyLogs(logs: Log[]): Set<Hex> {
     const touched = new Set<Hex>()
+    const swapsByTx = new Map<Hex, Hex[]>()
     for (const raw of logs) {
       const log = raw as MarketLog
       const addr = lc(log.address)
       const block = log.blockNumber ?? 0n
+      const pos = block * 1_000_000n + BigInt(log.logIndex ?? 0)
+      const fresh = (id: Hex) => {
+        if ((this.applied.get(id) ?? -1n) >= pos) return false
+        this.applied.set(id, pos)
+        return true
+      }
+      const noteSwap = (id: Hex) => {
+        if (!log.transactionHash) return
+        const list = swapsByTx.get(log.transactionHash)
+        if (list) list.push(id)
+        else swapsByTx.set(log.transactionHash, [id])
+      }
       switch (log.eventName) {
         case 'PoolCreated':
         case 'Initialize': {
@@ -102,6 +120,8 @@ export class Market {
               }
               break
             }
+            noteSwap(id)
+            if (!fresh(id)) break
             const a = log.args as { sqrtPriceX96: bigint; liquidity: bigint; tick: number; fee: number }
             this.states.set(id, stateFromSwap(pool, a, block, this.states.get(id)))
             touched.add(id)
@@ -111,6 +131,8 @@ export class Market {
               if (!this.reg.isUnresolvable(addr)) this.unknownV3.add(addr)
               break
             }
+            noteSwap(pool.id)
+            if (!fresh(pool.id)) break
             const a = log.args as { sqrtPriceX96: bigint; liquidity: bigint; tick: number }
             this.states.set(pool.id, stateFromSwap(pool, a, block))
             touched.add(pool.id)
@@ -129,7 +151,27 @@ export class Market {
         }
       }
     }
+    for (const [tx, ids] of swapsByTx) if (this.isClosedLoop(ids)) this.arbTxs.set(tx, ids)
     return touched
+  }
+
+  // A transaction whose swaps on known pools start and end in the same tokens is an arb.
+  private isClosedLoop(ids: Hex[]): boolean {
+    if (ids.length < 2 || !ids.some((id) => this.byPool.has(id))) return false
+    const count = new Map<Address, number>()
+    for (const id of ids) {
+      const p = this.reg.get(id)
+      if (!p) return false
+      for (const t of [p.token0, p.token1]) count.set(t, (count.get(t) ?? 0) + 1)
+    }
+    return [...count.values()].every((n) => n % 2 === 0)
+  }
+
+  // Arb transactions seen since the last call, with the tracked pools each one swapped.
+  drainArbTxs(): Map<Hex, Hex[]> {
+    const out = this.arbTxs
+    this.arbTxs = new Map()
+    return out
   }
 
   // Read fresh state for pools whose liquidity changed. Returns them as touched.
@@ -138,14 +180,24 @@ export class Market {
     this.needsRefresh.clear()
     const pools = ids.map((id) => this.reg.get(id)).filter((p): p is Pool => !!p)
     const fresh = await fetchStates(this.client, pools, block)
-    for (const [id, s] of fresh) this.states.set(id, s)
+    this.setStates(fresh, block)
     return new Set(fresh.keys())
   }
 
   async refreshAll(block: bigint): Promise<void> {
     const pools = [...this.byPool.keys()].map((id) => this.reg.get(id)).filter((p): p is Pool => !!p)
     const fresh = await fetchStates(this.client, pools, block)
-    for (const [id, s] of fresh) this.states.set(id, s)
+    this.setStates(fresh, block)
+  }
+
+  // State read at the end of `block` is newer than any event in that block or before it.
+  private setStates(fresh: Map<Hex, PoolState>, block: bigint): void {
+    const pos = block * 1_000_000n + 999_999n
+    for (const [id, st] of fresh) {
+      if ((this.applied.get(id) ?? -1n) > pos) continue
+      this.applied.set(id, pos)
+      this.states.set(id, st)
+    }
   }
 
   // Turn unknown pools seen in swaps into registry entries, then look for sibling venues of

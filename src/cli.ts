@@ -1,44 +1,49 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util'
 import { formatUnits, parseGwei, parseUnits } from 'viem'
-import { CHAIN_ID, COVEN_ARB, DEFAULT_RPCS, DEX_GENESIS_BLOCK, MIN_GAS_PRICE, USDC, gasEstimate, gasToUsdc } from './constants.js'
-import { readArbConfig } from './covenArb.js'
-import { describeCycle } from './cycles.js'
+import { CHAIN_ID, COVEN_PROBE, DEFAULT_RPCS, DEX_GENESIS_BLOCK, MIN_GAS_PRICE, USDC, gasEstimate, gasToUsdc } from './constants.js'
 import { backfillIndex } from './discovery.js'
-import { Logger, oppFields, run, usdc } from './engine.js'
+import { Logger, pricedFields, run, usdc } from './engine.js'
 import { Market } from './market.js'
 import { PoolRegistry, defaultCachePath } from './pools.js'
+import { findPayoutPools, payoutRoute, readProbeConfig } from './probe.js'
 import { createRpc } from './rpc.js'
 import { loadSigner } from './signer.js'
-import { evaluate } from './strategy.js'
+import { cycleCandidates, price } from './strategy.js'
 import { Trader } from './trader.js'
 
-const HELP = `coven-arb — atomic, capital-free arbitrage on Arc through CovenArb
+const HELP = `coven-arb — atomic, capital-free arbitrage on Arc through CovenProbe
 
 Usage:
-  coven-arb run      [--dry-run] [--min-profit <usdc>] [--bid <percent>] [--log <file>]
+  coven-arb run      [--dry-run] [--min-profit <usdc>] [--tip <gwei>] [--max-loss <usdc>] [--ws <url|off>] [--log <file>]
   coven-arb scan     [--min-profit <usdc>] [--json]
   coven-arb index    [--from <block>]
   coven-arb doctor
 
 Commands:
-  run     Watch every block and execute profitable cycles. --dry-run reports what it
-          would trade without signing anything.
-  scan    One pass over the current market; prints every opportunity verified on-chain.
+  run     Watch every block, simulate every candidate route through CovenProbe and send
+          the ones that pay for their gas. --dry-run reports what it would send without
+          signing anything.
+  scan    One pass over the current market; prints every route that is profitable on-chain.
   index   Index every v3/v4 pool ever created (resumable). Optional: run and scan discover
           active pools on their own, but a full index finds dormant venues too. Needs an
           RPC that serves historical logs; the public endpoints are slow at it.
-  doctor  Check RPC endpoints, the CovenArb contract, gas price and the signer.
+  doctor  Check RPC endpoints, the CovenProbe contract, gas price and the signer.
 
 Options:
   --rpc <url,...>        RPC endpoints, comma-separated; requests are spread across them
                          and transactions broadcast to all. Default: $ARC_RPC_URL or the
                          public Arc endpoints. A private endpoint is strongly recommended.
-  --min-profit <usdc>    Smallest profit worth trading, after CovenArb's fee and gas.
-                         Default 0.01.
-  --bid <percent>        Share of expected profit paid as priority fee. Arc orders by
-                         priority fee, so this decides races with other bots; a lost race
-                         reverts and still pays gas plus this bid. Default 20, floor 1 gwei.
+  --min-profit <usdc>    Smallest profit worth sending, after CovenProbe's 10% fee and gas.
+                         The contract enforces it: a send whose gap has gone costs only the
+                         check (~60k gas). Default 0.
+  --tip <gwei>           Priority fee per gas. Arc orders transactions by it; measured on
+                         Arc, bidding gives most of a contested profit away, so the default
+                         is 0 and the bot wins by sending only what pays.
+  --max-loss <usdc>      Stop once gas spent exceeds profit by this much. Default: no limit.
+  --ws <url|off>         Websocket endpoint for pushed market events; polling stays on as a
+                         safety net. Default: $ARC_WS_URL or the first --rpc URL as wss://.
+                         Needs Node 22+.
   --log <file>           Append every opportunity, trade and outcome as JSON lines.
   --json                 scan: print opportunities as JSON.
   --from <block>         index: oldest block to index. Default: the first DEX block.
@@ -46,8 +51,9 @@ Options:
 Signer (run only; there is deliberately no flag for it):
   COVEN_PRIVATE_KEY=0x...                           raw key, or
   COVEN_KEYSTORE=<file> COVEN_KEYSTORE_PASSWORD=... encrypted v3 keystore (geth, cast, MetaMask)
-  Trades need no capital: CovenArb settles each cycle atomically and reverts unless it
-  profits. The signer only needs USDC for gas, about 0.006 USDC per attempt.
+  Trades need no capital: CovenProbe settles each route atomically and pays only when it
+  profits. The signer only needs USDC for gas: a trade costs 0.004-0.014 USDC, a send whose
+  gap has gone ~0.0013, and each send needs ~0.03 USDC free up front.
 
 Environment:
   COVEN_ARB_CACHE        Directory for the pool registry (default ~/.cache/coven-arb).
@@ -65,7 +71,9 @@ function parseCli() {
       options: {
     rpc: { type: 'string' },
     'min-profit': { type: 'string' },
-    bid: { type: 'string' },
+    tip: { type: 'string' },
+    'max-loss': { type: 'string' },
+    ws: { type: 'string' },
     'dry-run': { type: 'boolean' },
     log: { type: 'string' },
     json: { type: 'boolean' },
@@ -85,13 +93,17 @@ const rpcUrls = (flags.rpc ?? process.env.ARC_RPC_URL ?? DEFAULT_RPCS.join(','))
   .split(',')
   .map((u) => u.trim())
   .filter(Boolean)
-const minNetText = flags['min-profit'] ?? '0.01'
-if (!/^\d+(\.\d{1,6})?$/.test(minNetText)) fail('--min-profit must be a USDC amount like 0.05')
-const minNet = parseUnits(minNetText, 6)
-const bidPct = Number(flags.bid ?? '20')
-if (!(bidPct >= 0 && bidPct < 100)) fail('--bid must be a percentage between 0 and 100')
-const bidBps = Math.round(bidPct * 100)
-const MIN_PRIORITY_FEE = parseGwei('1')
+const usdcFlag = (name: string, text: string) => {
+  if (!/^\d+(\.\d{1,6})?$/.test(text)) fail(`--${name} must be a USDC amount like 0.05`)
+  return parseUnits(text, 6)
+}
+const minNet = usdcFlag('min-profit', flags['min-profit'] ?? '0')
+const maxLoss = flags['max-loss'] !== undefined ? usdcFlag('max-loss', flags['max-loss']) : undefined
+const tipText = flags.tip ?? '0'
+if (!/^\d+(\.\d{1,9})?$/.test(tipText)) fail('--tip must be a gwei amount like 0 or 1.5')
+const tip = parseGwei(tipText)
+const wsFlag = flags.ws ?? process.env.ARC_WS_URL
+const wsUrl = wsFlag === 'off' ? undefined : (wsFlag ?? rpcUrls[0]?.replace(/^http/, 'ws'))
 const LOOKBACK = 20_000n // ~3 hours of blocks, read once at startup to find the active pools
 
 async function openMarket(log: Logger) {
@@ -113,28 +125,26 @@ async function doScan() {
   const log = new Logger()
   const quiet = flags.json
   const { rpc, market, head } = await openMarket(quiet ? new Logger() : log)
-  const [{ feeBps }, block] = await Promise.all([readArbConfig(rpc.client), rpc.client.getBlock({ blockNumber: head })])
-  const fees = { baseFee: block.baseFeePerGas ?? MIN_GAS_PRICE, minPriorityFee: MIN_PRIORITY_FEE, bidBps }
-  const candidates = market.screen(market.cycles).slice(0, 64)
-  const { opportunities, rejected } = await evaluate(rpc.client, candidates, { maxFeeBps: feeBps, fees, block: head })
-  const clearing = opportunities.filter((o) => o.net >= minNet)
+  const [{ feeBps }, block, hookPools] = await Promise.all([
+    readProbeConfig(rpc.client),
+    rpc.client.getBlock({ blockNumber: head }),
+    findPayoutPools(rpc.client, market.reg.all()),
+  ])
+  const base = block.baseFeePerGas ?? MIN_GAS_PRICE
+  const gasPrice = (base > MIN_GAS_PRICE ? base : MIN_GAS_PRICE) + tip
+  const candidates = [...cycleCandidates(market.screen(market.cycles), gasPrice, 64), ...hookPools.map((p) => payoutRoute(p)!)]
+  const priced = await price(rpc.client, candidates, { maxFeeBps: feeBps, gasPrice, blockNumber: head })
+  const clearing = priced.filter((p) => p.net >= minNet)
   if (flags.json) {
-    const out = opportunities.map((o) => ({ ...oppFields(o, market), clearsFloor: o.net >= minNet }))
+    const out = priced.map((p) => ({ ...pricedFields(p, market), clearsFloor: p.net >= minNet }))
     console.log(JSON.stringify(out, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2))
     return
   }
-  log.info(
-    `${market.cycles.length} cycles, ${candidates.length} with a positive spot edge, ${opportunities.length} profitable on-chain, ${clearing.length} clear ${usdc(minNet)} after gas`,
-  )
-  for (const o of opportunities) {
-    const mark = o.net >= minNet ? '✓' : ' '
-    console.log(
-      `${mark} ${describeCycle(o.cycle, market.symbol)}\n    in ${usdc(o.amountIn)}  profit ${usdc(o.profit)}  gas ${usdc(o.gasUsdc)}  net ${usdc(o.net)}  edge ${o.edgeBps.toFixed(1)}bps`,
-    )
+  log.info(`${market.cycles.length} cycles and ${hookPools.length} hook pools; simulated ${candidates.length}, ${priced.length} profitable on-chain, ${clearing.length} clear ${usdc(minNet)} after gas`)
+  for (const p of priced) {
+    const mark = p.net >= minNet ? '✓' : ' '
+    console.log(`${mark} ${p.candidate.label(market.symbol)}\n    profit ${usdc(p.profit)}  gas ${usdc(p.gasUsdc)}  net ${usdc(p.net)}`)
   }
-  const reasons = new Map<string, number>()
-  for (const r of rejected) reasons.set(r.reason, (reasons.get(r.reason) ?? 0) + 1)
-  if (rejected.length) log.info(`rejected on-chain: ${[...reasons].map(([r, n]) => `${n}× ${r}`).join(', ')}`)
 }
 
 async function doRun() {
@@ -142,15 +152,17 @@ async function doRun() {
   const account = flags['dry-run'] ? undefined : loadSigner()
   if (!flags['dry-run'] && !account) fail('run needs a signer: set COVEN_PRIVATE_KEY or COVEN_KEYSTORE (see --help), or pass --dry-run')
   const { rpc, market } = await openMarket(log)
-  const { feeBps } = await readArbConfig(rpc.client)
+  const { feeBps } = await readProbeConfig(rpc.client)
   const trader = account ? new Trader(rpc, account, { maxFeeBps: feeBps }) : undefined
   if (account) {
     const bal = await rpc.client.getBalance({ address: account.address })
-    const need = gasToUsdc(gasEstimate(3, 1), MIN_GAS_PRICE * 2n + MIN_PRIORITY_FEE) * 10n
+    // Room for a few sends at their up-front gas limit.
+    const need = (800_000n * Trader.maxFeePerGas(MIN_GAS_PRICE, tip) * 3n) / 1_000_000_000_000n
     log.info(`signer ${account.address}  balance ${formatUnits(bal, 18)} USDC`)
     if (bal / 1_000_000_000_000n < need) fail(`signer balance is below ${usdc(need)}; fund it with a little USDC for gas`, 1)
   }
-  log.info(`${account ? 'trading' : 'dry run'}: min net ${usdc(minNet)} after gas, CovenArb fee ${feeBps / 100}%, bidding ${bidPct}% of profit as priority fee`)
+  const loss = maxLoss !== undefined ? `, stop at a ${usdc(maxLoss)} loss` : ''
+  log.info(`${account ? 'trading' : 'dry run'} through CovenProbe ${COVEN_PROBE}: fee ${feeBps / 100}% of profit, min net ${usdc(minNet)} after gas, tip ${tipText} gwei${loss}`)
   const ctl = new AbortController()
   let stopping = false
   const stop = () => {
@@ -161,10 +173,10 @@ async function doRun() {
   }
   process.on('SIGINT', stop)
   process.on('SIGTERM', stop)
-  await run(market, { trader, minNet, bidBps, minPriorityFee: MIN_PRIORITY_FEE, maxFeeBps: feeBps, log, signal: ctl.signal })
+  await run(market, { trader, minNet, tip, maxLoss, maxFeeBps: feeBps, wsUrl, log, signal: ctl.signal })
   if (trader) {
     const t = trader.stats
-    log.info(`session: sent ${t.sent}, won ${t.won}, reverted ${t.reverted}, dropped ${t.dropped}; profit ${usdc(t.profit)}, gas ${usdc(t.gas)}, net ${usdc(t.profit - t.gas)}`)
+    log.info(`session: sent ${t.sent}, won ${t.won}, missed ${t.missed}, reverted ${t.reverted}, dropped ${t.dropped}; profit ${usdc(t.profit)}, gas ${usdc(t.gas)}, net ${usdc(t.profit - t.gas)}`)
   }
 }
 
@@ -237,16 +249,16 @@ async function doDoctor() {
   )
   const client = rpc.client
   try {
-    const code = await client.getCode({ address: COVEN_ARB })
-    const { feeBps, feeRecipient } = await readArbConfig(client)
-    add(!!code && code !== '0x', 'CovenArb', `${COVEN_ARB}, fee ${feeBps / 100}% of profit to ${feeRecipient}`)
+    const code = await client.getCode({ address: COVEN_PROBE })
+    const { feeBps, feeRecipient } = await readProbeConfig(client)
+    add(!!code && code !== '0x', 'CovenProbe', `${COVEN_PROBE}, fee ${feeBps / 100}% of profit to ${feeRecipient}`)
   } catch (e) {
-    add(false, 'CovenArb', String((e as Error).message).split('\n')[0]!)
+    add(false, 'CovenProbe', String((e as Error).message).split('\n')[0]!)
   }
   try {
     const block = await client.getBlock()
     const base = block.baseFeePerGas ?? 0n
-    const cost = gasToUsdc(gasEstimate(2, 0), (base > MIN_GAS_PRICE ? base : MIN_GAS_PRICE) + MIN_PRIORITY_FEE)
+    const cost = gasToUsdc(gasEstimate(2, 0), (base > MIN_GAS_PRICE ? base : MIN_GAS_PRICE) + tip)
     add(true, 'gas', `base fee ${formatUnits(base, 9)} gwei; a 2-leg trade costs ≈ ${usdc(cost)}`)
   } catch (e) {
     add(false, 'gas', String((e as Error).message).split('\n')[0]!)

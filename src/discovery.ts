@@ -6,7 +6,7 @@ import {
   v3PoolCreatedEvent,
   v4InitializeEvent,
 } from './abis.js'
-import { EURC, NATIVE, POOL_MANAGER, STATE_VIEW, USDC, V3_FACTORY } from './constants.js'
+import { EURC, NATIVE, POOL_MANAGER, STATE_VIEW, USDC, V3_FACTORIES, V3_FACTORY } from './constants.js'
 import { type Pool, type PoolKey, type PoolRegistry, DYNAMIC_FEE, isHooked, v4Pool, v4PoolId } from './pools.js'
 import { getLogsChunked } from './rpc.js'
 
@@ -21,8 +21,9 @@ export const V4_FEE_SPACINGS: [number, number][] = [
 const TICK_SPACINGS = [200, 60, 50, 25, 100, 10, 1, 30, 5, 20, 120, 240, 1000, 2000, 9000, 18000]
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
 
-// A v3 pool reconstructs entirely from its own getters. Only pools whose factory is the
-// canonical one are accepted: CovenArb trusts its callbacks only from canonical pools.
+// A v3-style pool reconstructs entirely from its own getters. Pools are accepted from the
+// factories CovenProbe is known to trade (Uniswap v3, Synthra, Slipstream clones), which
+// keeps spam pools that copy the Swap event out of the cycle set.
 export async function introspectV3(client: PublicClient, addresses: Address[]): Promise<Pool[]> {
   if (addresses.length === 0) return []
   const fns = ['factory', 'token0', 'token1', 'fee', 'tickSpacing'] as const
@@ -35,11 +36,13 @@ export async function introspectV3(client: PublicClient, addresses: Address[]): 
     const r = res.slice(i * fns.length, (i + 1) * fns.length)
     if (r.some((x) => x.status !== 'success')) return
     const [factory, token0, token1, fee, tickSpacing] = r.map((x) => x.result) as [Address, Address, Address, number, number]
-    if (lc(factory) !== lc(V3_FACTORY)) return
+    if (!FACTORIES.has(lc(factory))) return
     out.push({ kind: 'v3', id: lc(a), token0: lc(token0), token1: lc(token1), fee, tickSpacing, hooks: zeroAddress })
   })
   return out
 }
+
+const FACTORIES = new Set(V3_FACTORIES.map(lc))
 
 type KeyTail = { fee: number; tickSpacing: number; hooks: Address }
 
@@ -127,10 +130,10 @@ export async function recoverV4Key(
 }
 
 // Find the other venues a token trades on: canonical v3 tiers via the factory, and v4 pools
-// with common (fee, tickSpacing) pairs, hookless or with a hook the token already uses.
-// CovenLens misses most of these.
+// with common (fee, tickSpacing) pairs against USDC, EURC or native USDC, hookless or with a
+// hook the token already uses. CovenLens misses most of these.
 export async function probeSiblings(client: PublicClient, reg: PoolRegistry, tokens: Address[]): Promise<Pool[]> {
-  const quotes = [USDC, EURC].map(lc)
+  const quotes = [USDC, EURC, NATIVE].map(lc)
   const v3Calls: { a: Address; b: Address; fee: number }[] = []
   const v4Candidates: Pool[] = []
   for (const t of tokens.map(lc)) {
@@ -138,7 +141,8 @@ export async function probeSiblings(client: PublicClient, reg: PoolRegistry, tok
     for (const q of quotes) {
       if (q === t) continue
       const [c0, c1] = BigInt(q) < BigInt(t) ? [q, t] : [t, q]
-      for (const fee of V3_FEE_TIERS) v3Calls.push({ a: c0, b: c1, fee })
+      // v3 pools hold ERC-20s only.
+      if (q !== lc(NATIVE)) for (const fee of V3_FEE_TIERS) v3Calls.push({ a: c0, b: c1, fee })
       for (const [fee, tickSpacing] of V4_FEE_SPACINGS) {
         for (const h of hooks) {
           const p = v4Pool({ currency0: c0, currency1: c1, fee, tickSpacing, hooks: h })

@@ -74,11 +74,33 @@ describe('cycles', () => {
     expect(indexByPool(cycles).get(c.id)!.length).toBe(4)
   })
 
-  it('leaves native-quoted pools out', () => {
+  it('trades between native and ERC-20 USDC pools on the same token', () => {
     const reg = new PoolRegistry()
-    reg.add(v3(usdc, TOKEN))
-    reg.add(v4Pool({ currency0: zeroAddress, currency1: TOKEN, fee: 2500, tickSpacing: 50, hooks: zeroAddress }))
-    expect(enumerateCycles(reg)).toHaveLength(0)
+    const erc = v3(usdc, TOKEN)
+    const nat = v4Pool({ currency0: zeroAddress, currency1: TOKEN, fee: 2500, tickSpacing: 50, hooks: zeroAddress })
+    reg.add(erc)
+    reg.add(nat)
+    const cycles = enumerateCycles(reg)
+    expect(cycles).toHaveLength(2)
+    const starts = cycles.map((c) => [c.legs[0]!.tokenIn, c.legs[1]!.tokenOut]).sort()
+    expect(starts).toEqual([[zeroAddress, usdc], [usdc, zeroAddress]].sort())
+  })
+
+  it('prices a native pool in 6-decimal units, so a fair native/ERC-20 pair shows no edge', () => {
+    const reg = new PoolRegistry()
+    const erc = v3(usdc, OTHER)
+    const nat = v4Pool({ currency0: zeroAddress, currency1: OTHER, fee: 3000, tickSpacing: 60, hooks: zeroAddress })
+    reg.add(erc)
+    reg.add(nat)
+    const Q96 = 2n ** 96n
+    // 1 OTHER (18 dec) = 2 USDC: 2e6 raw ERC-20 USDC or 2e18 raw native per 1e18 OTHER.
+    // Prices are token1 per token0; USDC (0x36..) and native (0x0) are token0 in both pools.
+    const sqrt = (p: number) => BigInt(Math.floor(Math.sqrt(p) * Number(Q96)))
+    const states = new Map([
+      [erc.id, { sqrtPriceX96: sqrt(1e18 / 2e6), tick: 0, liquidity: 10n ** 15n, lpFee: 3000, block: 1n }],
+      [nat.id, { sqrtPriceX96: sqrt(1e18 / 2e18), tick: 0, liquidity: 10n ** 21n, lpFee: 3000, block: 1n }],
+    ])
+    for (const c of enumerateCycles(reg)) expect(screen(c, states)).toBeNull()
   })
 
   it('screens a mispriced pair and ignores a fair one', () => {

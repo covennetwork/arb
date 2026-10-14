@@ -1,83 +1,79 @@
-import type { PublicClient } from 'viem'
-import { WEI_PER_USDC, gasEstimate, gasToUsdc } from './constants.js'
-import { type ProbeResult, probe } from './covenArb.js'
-import type { Cycle, Screened } from './cycles.js'
-import { sizeGrid } from './math.js'
+import type { Address, PublicClient } from 'viem'
+import { gasToUsdc } from './constants.js'
+import type { Screened } from './cycles.js'
+import { type Candidate, cycleRoute, simulate } from './probe.js'
 
-export type Opportunity = {
-  cycle: Cycle
-  amountIn: bigint
-  // Profit the contract pays out, after its own fee. Exact as of the probed block.
+export type Priced = {
+  candidate: Candidate
+  // Profit after CovenProbe's fee as simulated, the gas a send costs at the chosen tip, and
+  // what is left (6-dec USDC).
   profit: bigint
-  // Priority fee per gas this trade bids, and the total gas bill at that bid (USDC 6dp).
-  priorityFee: bigint
   gasUsdc: bigint
   net: bigint
-  edgeBps: number
-  // Block the profit was measured at, when probed at a fixed block.
-  block?: bigint
 }
 
-export type FeePolicy = {
-  baseFee: bigint
-  // Floor on the priority fee, in wei per gas.
-  minPriorityFee: bigint
-  // Share of expected profit bid as priority fee, in basis points. Arc orders transactions
-  // by priority fee, so when two bots race for the same cycle the higher bid lands first and
-  // the other reverts.
-  bidBps: number
-}
-
-// Priority fee that spends `bidBps` of the profit, given the trade's gas use.
-export function priorityFeeFor(profit: bigint, gas: bigint, p: FeePolicy): bigint {
-  const bid = (profit * WEI_PER_USDC * BigInt(p.bidBps)) / 10_000n / gas
-  return bid > p.minPriorityFee ? bid : p.minPriorityFee
-}
-
-export type Rejection = { cycle: Cycle; edgeBps: number; reason: string }
-
-// Sizes each screened cycle on-chain: one probe per point of a geometric grid around the
-// model's seed, all in a single round trip. The best grid point is the trade.
-export async function evaluate(
+// Price every candidate in one round of eth_calls at `blockNumber`: the contract sizes and
+// trades each route against that block's state, so the profit includes every tick
+// crossing, hook and fee. Candidates that would not trade are left out.
+export async function price(
   client: PublicClient,
-  candidates: Screened[],
-  opts: { maxFeeBps: number; fees: FeePolicy; block?: bigint; points?: number },
-): Promise<{ opportunities: Opportunity[]; rejected: Rejection[] }> {
-  const grids = candidates.map((c) => sizeGrid(c.seedIn, opts.points ?? 16))
-  const requests = candidates.flatMap((c, i) => grids[i]!.map((amountIn) => ({ cycle: c.cycle, amountIn })))
-  const results: ProbeResult[] = requests.length ? await probe(client, requests, { maxFeeBps: opts.maxFeeBps, blockNumber: opts.block }) : []
-  const opportunities: Opportunity[] = []
-  const rejected: Rejection[] = []
-  let k = 0
-  candidates.forEach((c, i) => {
-    let best: { amountIn: bigint; profit: bigint } | undefined
-    const reasons = new Map<string, number>()
-    for (const amountIn of grids[i]!) {
-      const r = results[k++]!
-      if (r.ok) {
-        if (!best || r.profit > best.profit) best = { amountIn, profit: r.profit }
-      } else {
-        reasons.set(r.reason, (reasons.get(r.reason) ?? 0) + 1)
-      }
-    }
-    if (!best) {
-      const reason = [...reasons].sort((a, b) => b[1] - a[1])[0]?.[0] ?? 'no profit'
-      rejected.push({ cycle: c.cycle, edgeBps: c.edgeBps, reason })
-      return
-    }
-    const gas = gasEstimate(c.cycle.legs.length, c.cycle.hooked)
-    const priorityFee = priorityFeeFor(best.profit, gas, opts.fees)
-    const gasUsdc = gasToUsdc(gas, opts.fees.baseFee + priorityFee)
-    opportunities.push({ cycle: c.cycle, ...best, priorityFee, gasUsdc, net: best.profit - gasUsdc, edgeBps: c.edgeBps, block: opts.block })
+  candidates: Candidate[],
+  opts: { maxFeeBps: number; gasPrice: bigint; account?: Address; blockNumber?: bigint },
+): Promise<Priced[]> {
+  if (candidates.length === 0) return []
+  const profits = await simulate(client, candidates.map((c) => c.route), { maxFeeBps: opts.maxFeeBps, account: opts.account, blockNumber: opts.blockNumber })
+  const out: Priced[] = []
+  candidates.forEach((candidate, i) => {
+    const profit = profits[i]!
+    if (profit <= 0n) return
+    const gasUsdc = gasToUsdc(candidate.gas, opts.gasPrice)
+    out.push({ candidate, profit, gasUsdc, net: profit - gasUsdc })
   })
-  opportunities.sort((a, b) => (b.net > a.net ? 1 : b.net < a.net ? -1 : 0))
-  return { opportunities, rejected }
+  return out.sort((a, b) => (b.net > a.net ? 1 : b.net < a.net ? -1 : 0))
+}
+
+// Screened cycles worth simulating: the off-chain model must value them at a quarter of the
+// gas bill at least, since it is rough and the chain decides.
+export function cycleCandidates(screened: Screened[], gasPrice: bigint, max: number): Candidate[] {
+  const out: Candidate[] = []
+  for (const s of screened) {
+    const c = cycleRoute(s.cycle, s.seedIn)
+    if (s.seedProfit * 4n < gasToUsdc(c.gas, gasPrice)) continue
+    out.push(c)
+    if (out.length >= max) break
+  }
+  return out
+}
+
+// After a send that missed, the route sits out for a while, doubling with each consecutive
+// miss: the simulation cannot see who else is about to take the same gap.
+export class Backoff {
+  private state = new Map<string, { until: number; streak: number }>()
+
+  constructor(
+    private baseMs = 30_000,
+    private maxMs = 10 * 60_000,
+  ) {}
+
+  blocked(id: string, now = Date.now()): boolean {
+    const s = this.state.get(id)
+    return !!s && now < s.until
+  }
+
+  lost(id: string, now = Date.now()): void {
+    const streak = (this.state.get(id)?.streak ?? 0) + 1
+    this.state.set(id, { streak, until: now + Math.min(this.maxMs, this.baseMs * 2 ** (streak - 1)) })
+  }
+
+  won(id: string): void {
+    this.state.delete(id)
+  }
 }
 
 // The spot screen cannot see hook fees or thin liquidity just past the current tick, so some
-// cycles look profitable forever while never being so on-chain. After a cycle fails a probe,
-// it is only probed again once its edge clears the failed edge by a margin, or the floor
-// expires.
+// cycles look profitable forever while never being so on-chain. After a cycle simulates at
+// no profit, it is only simulated again once its edge clears the failed edge by a margin, or
+// the floor expires.
 export class EdgeFloors {
   private floors = new Map<string, { bps: number; until: number }>()
 
@@ -86,22 +82,22 @@ export class EdgeFloors {
     private ttlMs = 10 * 60_000,
   ) {}
 
-  get(c: Cycle): number {
-    const f = this.floors.get(c.id)
+  get(id: string): number {
+    const f = this.floors.get(id)
     if (!f) return 0
     if (Date.now() > f.until) {
-      this.floors.delete(c.id)
+      this.floors.delete(id)
       return 0
     }
     return f.bps
   }
 
-  fail(c: Cycle, edgeBps: number): void {
+  fail(id: string, edgeBps: number): void {
     // Proportional too: dust pools sit at edges of thousands of bps that wobble with every trade.
-    this.floors.set(c.id, { bps: edgeBps * 1.05 + this.marginBps, until: Date.now() + this.ttlMs })
+    this.floors.set(id, { bps: edgeBps * 1.05 + this.marginBps, until: Date.now() + this.ttlMs })
   }
 
-  clear(c: Cycle): void {
-    this.floors.delete(c.id)
+  clear(id: string): void {
+    this.floors.delete(id)
   }
 }

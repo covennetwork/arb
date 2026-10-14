@@ -1,14 +1,11 @@
 import { appendFileSync } from 'node:fs'
-import { type Log, formatUnits } from 'viem'
-import { marketEvents } from './abis.js'
-import { readArbConfig } from './covenArb.js'
-import { describeCycle } from './cycles.js'
+import { type Hex, formatGwei, formatUnits } from 'viem'
+import { MIN_GAS_PRICE, gasLimitFor } from './constants.js'
+import { MarketFeed } from './feed.js'
 import type { Market } from './market.js'
-import { MIN_GAS_PRICE, gasEstimate, gasToUsdc } from './constants.js'
-import type { Screened } from './cycles.js'
-import { getLogsChunked, isRangeError } from './rpc.js'
-import { EdgeFloors, type Opportunity, evaluate } from './strategy.js'
-import type { Outcome, Trader } from './trader.js'
+import { type Candidate, findPayoutPools, hookInventory, payoutRoute, readProbeConfig } from './probe.js'
+import { Backoff, EdgeFloors, type Priced, cycleCandidates, price } from './strategy.js'
+import { LowBalanceError, type Outcome, type Trader } from './trader.js'
 
 export const usdc = (v: bigint) => `${formatUnits(v, 6)} USDC`
 const signed = (v: bigint) => `${v >= 0n ? '+' : ''}${formatUnits(v, 6)}`
@@ -31,11 +28,15 @@ export class Logger {
 
 export type RunOptions = {
   trader?: Trader
-  // Floor on profit after CovenArb's fee and gas, in USDC (6dp).
+  // Floor on profit after CovenProbe's fee and gas, in USDC (6dp).
   minNet: bigint
-  // Share of expected profit bid as priority fee (bps), and the floor on that fee (wei).
-  bidBps: number
-  minPriorityFee: bigint
+  // Priority fee per gas (wei). Arc orders by it; the measured edge is in sending only what
+  // pays, not in bidding, so the default is 0.
+  tip: bigint
+  // Stop once gas spent exceeds profit by this much (USDC 6dp).
+  maxLoss?: bigint
+  // Websocket endpoint for pushed market events; polling only when absent.
+  wsUrl?: string
   maxFeeBps: number
   log: Logger
   pollMs?: number
@@ -48,96 +49,90 @@ const FULL_SCAN_MS = 30_000
 const REFRESH_MS = 5 * 60_000
 const STATUS_MS = 60_000
 
-export function oppFields(o: Opportunity, market: Market) {
+export function pricedFields(p: Priced, market: Market) {
   return {
-    route: describeCycle(o.cycle, market.symbol),
-    pools: o.cycle.legs.map((l) => l.pool.id),
-    amountIn: o.amountIn,
-    profit: o.profit,
-    gas: o.gasUsdc,
-    priorityFeeGwei: Number(o.priorityFee) / 1e9,
-    net: o.net,
-    edgeBps: Math.round(o.edgeBps * 10) / 10,
-    block: o.block,
+    route: p.candidate.label(market.symbol),
+    id: p.candidate.id,
+    pools: p.candidate.pools,
+    profit: p.profit,
+    gas: p.gasUsdc,
+    net: p.net,
   }
 }
 
-// The live loop: per new block, apply market events, re-screen the cycles they touched,
-// size survivors on-chain and trade those that clear the floor.
+// The live loop. Per batch of new market events: update pool state, re-screen the cycles the
+// events touched (all of them every 30 s), add the payout routes of touched fair-launch hook
+// pools, simulate every candidate through CovenProbe in one round of eth_calls, and send each
+// one that pays for its gas, alone, at the chosen tip. The send carries its gas cost as the
+// on-chain profit floor, so a gap someone else takes first costs only the check (~60k gas).
 export async function run(market: Market, opts: RunOptions): Promise<void> {
   const { client } = market
   const { log, trader } = opts
   const floors = new EdgeFloors()
-  let cursor = market.reg.syncedTo ?? (await client.getBlockNumber())
+  const backoff = new Backoff()
+  const start = market.reg.syncedTo ?? (await client.getBlockNumber())
   let baseFee = (await client.getBlock()).baseFeePerGas ?? MIN_GAS_PRICE
-  // Near the head, one eth_getLogs up to 'latest' is the whole poll. When behind, catch up
-  // in explicit ranges.
-  let catchingUp = true
+  const gasPrice = () => (baseFee > MIN_GAS_PRICE ? baseFee : MIN_GAS_PRICE) + opts.tip
+  const feed = new MarketFeed(client, start + 1n, opts.wsUrl, (m) => log.info(m))
+  feed.start()
+  let payouts = new Map<Hex, Candidate>()
+  const refreshPayouts = async () => {
+    const pools = await findPayoutPools(client, market.reg.all())
+    payouts = new Map(pools.map((p) => [p.id, payoutRoute(p)!]))
+  }
+  await refreshPayouts().catch((e) => log.event('error', { where: 'payouts', reason: String(e) }))
+  log.info(`watching ${market.cycles.length} cycles and ${payouts.size} fair-launch hook pools`)
   let lastFull = 0
   let lastRefresh = Date.now()
   let lastStatus = Date.now()
+  let lowBalanceUntil = 0
   let discovery: Promise<void> | undefined
-  let probed = 0
-  let found = 0
+  let lastHead = start
+  const stats = { simulated: 0, profitable: 0, belowFloor: 0 }
 
   const report = (o: Outcome) => {
     const net = o.profit - o.gas
-    const route = describeCycle(o.opportunity.cycle, market.symbol)
-    log.info(`${o.status.padEnd(8)} ${o.hash}  ${route}  profit ${usdc(o.profit)}  gas ${usdc(o.gas)}  net ${signed(net)}`)
+    const id = o.send.candidate.id
+    if (o.status === 'won') backoff.won(id)
+    else backoff.lost(id)
+    log.info(`${o.status.padEnd(8)} ${o.hash}  ${o.send.candidate.label(market.symbol)}  profit ${usdc(o.profit)}  gas ${usdc(o.gas)}  net ${signed(net)}`)
     log.event('outcome', {
-      ...oppFields(o.opportunity, market),
+      route: o.send.candidate.label(market.symbol),
+      id,
       hash: o.hash,
       status: o.status,
+      expectedProfit: o.send.profit,
       realizedProfit: o.profit,
+      protocolFee: o.fee,
       gasPaid: o.gas,
       realizedNet: net,
+      seenBlock: o.send.block,
       landedBlock: o.block,
     })
   }
 
   while (!opts.signal?.aborted) {
     try {
-      let logs: Log[]
-      let head: bigint
-      if (catchingUp) {
-        head = await client.getBlockNumber()
-        logs = head > cursor ? await getLogsChunked(client, { events: marketEvents, fromBlock: cursor + 1n, toBlock: head }) : []
-        catchingUp = false
-      } else {
-        try {
-          logs = (await client.getLogs({ events: marketEvents, fromBlock: cursor + 1n, toBlock: 'latest', strict: true })) as Log[]
-        } catch (e) {
-          if (isRangeError(e)) {
-            // Too far behind for one query.
-            catchingUp = true
-            continue
-          }
-          // Endpoints answer a bare "invalid params" when fromBlock is past their head: the
-          // round robin reached a backend that has not seen the latest block yet.
-          if (!/invalid param/i.test(String((e as Error).message))) throw e
-          logs = []
-        }
-        // Blocks without market events are simply covered again by the next poll.
-        head = logs.reduce((m, l) => (l.blockNumber !== null && l.blockNumber > m ? l.blockNumber : m), cursor)
-      }
-      if (head <= cursor) {
+      const { logs, head } = await feed.next(opts.pollMs)
+      if (logs.length === 0 && head <= lastHead) {
         if (trader) for (const o of await trader.poll()) report(o)
-        await sleep(opts.pollMs ?? 150)
         continue
       }
+      lastHead = head > lastHead ? head : lastHead
       const seenAt = Date.now()
       const touched = market.applyLogs(logs)
       for (const id of await market.refreshChanged(head)) touched.add(id)
-      cursor = head
-      market.reg.syncedTo = head
+      market.reg.syncedTo = feed.synced
       market.reg.markDirty()
+      market.drainArbTxs()
 
       discovery ??= market
         .resolveUnknown()
-        .then((added) => {
+        .then(async (added) => {
           if (added > 0) {
             lastFull = 0
-            log.info(`discovered ${added} pool(s); tracking ${market.stats().cycles} cycles`)
+            await refreshPayouts()
+            log.info(`discovered ${added} pool(s); watching ${market.stats().cycles} cycles and ${payouts.size} hook pools`)
           }
         })
         .catch((e) => log.event('error', { where: 'discovery', reason: String(e) }))
@@ -148,74 +143,93 @@ export async function run(market: Market, opts: RunOptions): Promise<void> {
       const full = Date.now() - lastFull > FULL_SCAN_MS
       if (full) lastFull = Date.now()
       const busy = trader?.busyPools() ?? new Set()
-      // The virtual-reserve model is rough, but a cycle it values at under a quarter of the
-      // gas bill is not worth a probe.
-      const worthProbing = (s: Screened) =>
-        s.seedProfit * 4n >= gasToUsdc(gasEstimate(s.cycle.legs.length, s.cycle.hooked), baseFee + opts.minPriorityFee) + opts.minNet
-      const candidates = market
-        .screen(full ? market.cycles : market.cyclesThrough(touched), (c) => floors.get(c))
-        .filter((s) => worthProbing(s) && !s.cycle.legs.some((l) => busy.has(l.pool.id)))
-        .slice(0, opts.maxCandidates ?? 8)
+      const free = (c: Candidate) => !backoff.blocked(c.id) && !c.pools.some((id) => busy.has(id))
+      const screened = market.screen(full ? market.cycles : market.cyclesThrough(touched), (c) => floors.get(c.id))
+      const candidates = cycleCandidates(screened, gasPrice(), opts.maxCandidates ?? 24).filter(free)
+      for (const [id, c] of payouts) if ((full || touched.has(id)) && free(c)) candidates.push(c)
+      if (candidates.length === 0) {
+        if (trader) for (const o of await trader.poll()) report(o)
+        continue
+      }
 
-      if (candidates.length > 0) {
-        probed += candidates.length
-        const fees = { baseFee, minPriorityFee: opts.minPriorityFee, bidBps: opts.bidBps }
-        // Probe at 'latest' rather than `head`: the chain may already be a block further on.
-        const { opportunities, rejected } = await evaluate(client, candidates, { maxFeeBps: opts.maxFeeBps, fees })
-        for (const r of rejected) floors.fail(r.cycle, r.edgeBps)
-        for (const o of opportunities) {
-          if (o.net < opts.minNet) {
-            floors.fail(o.cycle, o.edgeBps)
-            log.event('below_floor', oppFields(o, market))
+      stats.simulated += candidates.length
+      const priced = await price(client, candidates, { maxFeeBps: opts.maxFeeBps, gasPrice: gasPrice(), account: trader?.account.address })
+      const pricedIds = new Set(priced.map((p) => p.candidate.id))
+      for (const s of screened) if (!pricedIds.has(s.cycle.id)) floors.fail(s.cycle.id, s.edgeBps)
+      for (const p of priced) {
+        stats.profitable++
+        if (p.net < opts.minNet) {
+          stats.belowFloor++
+          log.event('below_floor', pricedFields(p, market))
+          continue
+        }
+        const route = p.candidate.label(market.symbol)
+        if (!trader) {
+          log.info(`would send  ${route}  profit ${usdc(p.profit)}  net ${signed(p.net)}  (${Date.now() - seenAt} ms after block ${head})`)
+          log.event('opportunity', { dryRun: true, reactionMs: Date.now() - seenAt, block: head, ...pricedFields(p, market) })
+          continue
+        }
+        if (!trader.canSend(p.candidate) || Date.now() < lowBalanceUntil) continue
+        try {
+          // The floor the contract enforces: the send must pay for its own gas plus --min-profit.
+          const r = p.candidate.route
+          const gate = p.candidate.payout
+            ? { ...r.gate, min: (await hookInventory(client, p.candidate)) / 2n || 1n }
+            : r.gate
+          const legs = r.legs.length
+          const hooked = r.legs.filter((l) => l.v4 && l.key.hooks !== '0x0000000000000000000000000000000000000000').length
+          const v3 = r.legs.filter((l) => !l.v4).length
+          const gasLimit = p.candidate.payout ? 800_000n : gasLimitFor(legs, hooked, v3)
+          const send = { candidate: p.candidate, route: { ...r, minProfit: p.gasUsdc + opts.minNet, gate }, profit: p.profit, block: head, gasUsdc: p.gasUsdc, net: p.net, gasLimit, tip: opts.tip }
+          const hash = await trader.submit(send, baseFee)
+          const reactionMs = Date.now() - seenAt
+          log.info(`sent     ${hash}  ${route}  expect ${usdc(p.profit)}  net ${signed(p.net)}  tip ${formatGwei(opts.tip)} gwei  (${reactionMs} ms after block ${head})`)
+          log.event('sent', { hash, reactionMs, block: head, ...pricedFields(p, market) })
+        } catch (e) {
+          if (e instanceof LowBalanceError) {
+            lowBalanceUntil = Date.now() + 60_000
+            log.info(`NOT SENT: ${e.message}`)
+            log.event('low_balance', { have: e.have, need: e.need, ...pricedFields(p, market) })
             continue
           }
-          found++
-          const route = describeCycle(o.cycle, market.symbol)
-          if (!trader) {
-            log.info(`would trade  ${route}  in ${usdc(o.amountIn)}  net ${signed(o.net)}  (${Date.now() - seenAt} ms after block ${head})`)
-            log.event('opportunity', { dryRun: true, reactionMs: Date.now() - seenAt, triggerBlock: head, ...oppFields(o, market) })
-            floors.fail(o.cycle, o.edgeBps)
-            continue
-          }
-          if (!trader.canSend(o)) continue
-          try {
-            const hash = await trader.submit(o, baseFee)
-            const reactionMs = Date.now() - seenAt
-            log.info(`sent     ${hash}  ${route}  in ${usdc(o.amountIn)}  expect net ${signed(o.net)}  (${reactionMs} ms after the trigger)`)
-            log.event('sent', { hash, reactionMs, triggerBlock: head, ...oppFields(o, market) })
-          } catch (e) {
-            log.info(`send failed: ${String((e as Error).message).split('\n')[0]}`)
-            log.event('error', { where: 'send', reason: String(e), ...oppFields(o, market) })
-          }
+          log.info(`send failed: ${String((e as Error).message).split('\n')[0]}`)
+          log.event('error', { where: 'send', reason: String(e), ...pricedFields(p, market) })
         }
       }
 
       if (trader) for (const o of await trader.poll()) report(o)
+      if (trader && opts.maxLoss !== undefined && trader.stats.gas - trader.stats.profit > opts.maxLoss) {
+        log.info(`stopping: net loss ${usdc(trader.stats.gas - trader.stats.profit)} reached --max-loss`)
+        break
+      }
 
       if (Date.now() - lastRefresh > REFRESH_MS) {
         lastRefresh = Date.now()
         await market.refreshAll(head)
+        await refreshPayouts().catch(() => undefined)
         baseFee = (await client.getBlock()).baseFeePerGas ?? baseFee
-        if ((await client.getBlockNumber()) - cursor > 100n) catchingUp = true
-        const { feeBps } = await readArbConfig(client)
-        if (feeBps > opts.maxFeeBps) log.info(`CovenArb fee rose to ${feeBps / 100}% (plans cap it at ${opts.maxFeeBps / 100}%); trades will revert until restart`)
+        if ((await client.getBlockNumber()) - feed.synced > 100n) feed.resync()
+        const { feeBps } = await readProbeConfig(client)
+        if (feeBps > opts.maxFeeBps) log.info(`CovenProbe fee rose to ${feeBps / 100}% (sends cap it at ${opts.maxFeeBps / 100}%); sends will revert until restart`)
         market.reg.save()
       }
       if (Date.now() - lastStatus > STATUS_MS) {
         lastStatus = Date.now()
         const s = market.stats()
         const t = trader?.stats
-        const pnl = t ? `  sent ${t.sent} won ${t.won} reverted ${t.reverted} dropped ${t.dropped}  net ${signed(t.profit - t.gas)} USDC` : ''
-        log.info(`block ${head}  ${s.pools} pools  ${s.cycles} cycles  probed ${probed}  profitable ${found}${pnl}`)
-        log.event('status', { block: head, ...s, probed, found, ...(t ?? {}) })
+        const pnl = t ? `  sent ${t.sent} won ${t.won} missed ${t.missed} reverted ${t.reverted} dropped ${t.dropped}  net ${signed(t.profit - t.gas)} USDC` : ''
+        log.info(`block ${head}  ${s.cycles} cycles  ${payouts.size} hook pools  ${feed.live ? 'ws' : 'polling'}  simulated ${stats.simulated}  profitable ${stats.profitable}${pnl}`)
+        log.event('status', { block: head, ...s, ...stats, hookPools: payouts.size, websocket: feed.live, ...(t ?? {}) })
       }
     } catch (e) {
-      log.info(`error: ${String((e as Error).message ?? e).split('\n')[0]}`)
+      const err = e as { shortMessage?: string; details?: string; message?: string }
+      log.info(`error: ${[err.shortMessage, err.details].filter(Boolean).join(' ') || String(err.message ?? e).split('\n')[0]}`)
       log.event('error', { where: 'loop', reason: String(e) })
       await sleep(1000)
     }
   }
 
+  feed.close()
   if (trader && trader.pendingCount > 0) {
     log.info(`waiting for ${trader.pendingCount} pending transaction(s)`)
     const until = Date.now() + 15_000

@@ -1,7 +1,7 @@
 {
   "name": "@covennetwork/arb",
-  "version": "0.3.0",
-  "description": "Capital-free atomic arbitrage bot and library for Arc: discovers every v3/v4 venue, verifies each cycle on-chain through CovenArb, and races it with a profit-share priority bid.",
+  "version": "0.5.0",
+  "description": "Capital-free atomic arbitrage bot and library for Arc: discovers v3/v4 venues, native-USDC pools and fair-launch hook payouts, simulates every route through CovenProbe each block, and sends only what pays for its gas.",
   "license": "MIT",
   "homepage": "https://coven.network",
   "keywords": [
@@ -15,7 +15,7 @@
   ],
   "type": "module",
   "bin": {
-    "coven-arb": "./dist/cli.js"
+    "coven-arb": "dist/cli.js"
   },
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",

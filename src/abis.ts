@@ -41,7 +41,8 @@ export const v3PoolAbi = parseAbi([
   'function fee() view returns (uint24)',
   'function tickSpacing() view returns (int24)',
   'function liquidity() view returns (uint128)',
-  'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
+  // Only the fields every v3-style variant shares: Slipstream clones return fewer after them.
+  'function slot0() view returns (uint160 sqrtPriceX96, int24 tick)',
 ])
 
 export const v3FactoryAbi = parseAbi(['function getPool(address, address, uint24) view returns (address)'])
@@ -70,4 +71,21 @@ export const covenArbAbi = parseAbi([
   'error UnexpectedCallback()',
   'error InvalidPlan()',
   'error ZeroMinProfit()',
+])
+
+export const covenProbeAbi = parseAbi([
+  'struct PoolKey { address currency0; address currency1; uint24 fee; int24 tickSpacing; address hooks; }',
+  'struct Leg { bool v4; bool zeroForOne; uint24 feePips; address pool; address tokenIn; address tokenOut; PoolKey key; bytes hookData; }',
+  'struct Gate { address target; bytes data; uint256 word; uint256 min; }',
+  'struct Route { Leg[] legs; uint256 amountIn; uint256 minProfit; bool sized; bool firstAtPrice; bool check; Gate gate; }',
+  'function probe(Route[] routes, uint16 maxFeeBps) returns (uint256[] profits)',
+  'function feeBps() view returns (uint16)',
+  'function feeRecipient() view returns (address)',
+  'event Executed(address indexed caller, uint256 indexed route, uint256 profit, uint256 fee)',
+  'error FeeAbovePlanLimit(uint16 feeBps, uint16 maxFeeBps)',
+])
+
+// Fair-launch hooks keep the swap fees they collect per pool and sell them to the next swapper.
+export const fairLaunchHookAbi = parseAbi([
+  'function poolFees((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key) view returns (uint256 fees0, uint256 fees1)',
 ])
