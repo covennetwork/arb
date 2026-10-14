@@ -46,9 +46,10 @@ COVEN_PRIVATE_KEY=0x... coven-arb run --log trades.jsonl
    contract skips the trade and the send costs ~60k gas (~0.0013 USDC). A payout route also
    carries a gate: the hook must still hold at least half the inventory the bot saw.
 7. **Account and back off.** Each receipt is matched to CovenProbe's `Executed` event for the
-   signer: profit paid and fee taken. A route that missed sits out for 30 s, doubling with
-   each consecutive miss up to 10 minutes. Every opportunity, send, outcome and status line
-   goes to the `--log` file as JSON lines.
+   signer: profit paid and fee taken. After a miss, every pool the route used sits out for 30 s,
+   doubling with each consecutive miss up to 30 minutes, since many cycles share the same
+   contested pools. Hook payout routes are exempt: their gate makes a miss cheap. Every
+   opportunity, send, outcome and status line goes to the `--log` file as JSON lines.
 
 ## Commands
 

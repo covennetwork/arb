@@ -45,8 +45,9 @@ export function cycleCandidates(screened: Screened[], gasPrice: bigint, max: num
   return out
 }
 
-// After a send that missed, the route sits out for a while, doubling with each consecutive
-// miss: the simulation cannot see who else is about to take the same gap.
+// After a send that missed, its pools sit out for a while, doubling with each consecutive
+// miss: the simulation cannot see who else is about to take the same gap, and a contested
+// pool keeps showing gaps through many slightly different cycles.
 export class Backoff {
   private state = new Map<string, { until: number; streak: number }>()
 

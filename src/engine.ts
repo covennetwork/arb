@@ -69,7 +69,8 @@ export async function run(market: Market, opts: RunOptions): Promise<void> {
   const { client } = market
   const { log, trader } = opts
   const floors = new EdgeFloors()
-  const backoff = new Backoff()
+  // Keyed by pool: many cycles share the same contested pools, so a miss on one pauses them all.
+  const backoff = new Backoff(30_000, 30 * 60_000)
   const start = market.reg.syncedTo ?? (await client.getBlockNumber())
   let baseFee = (await client.getBlock()).baseFeePerGas ?? MIN_GAS_PRICE
   const gasPrice = () => (baseFee > MIN_GAS_PRICE ? baseFee : MIN_GAS_PRICE) + opts.tip
@@ -93,8 +94,13 @@ export async function run(market: Market, opts: RunOptions): Promise<void> {
   const report = (o: Outcome) => {
     const net = o.profit - o.gas
     const id = o.send.candidate.id
-    if (o.status === 'won') backoff.won(id)
-    else backoff.lost(id)
+    // A payout route's gate makes a miss cheap (~45k gas) and payouts can be large: no pause.
+    if (!o.send.candidate.payout) {
+      for (const pool of o.send.candidate.pools) {
+        if (o.status === 'won') backoff.won(pool)
+        else backoff.lost(pool)
+      }
+    }
     log.info(`${o.status.padEnd(8)} ${o.hash}  ${o.send.candidate.label(market.symbol)}  profit ${usdc(o.profit)}  gas ${usdc(o.gas)}  net ${signed(net)}`)
     log.event('outcome', {
       route: o.send.candidate.label(market.symbol),
@@ -143,7 +149,7 @@ export async function run(market: Market, opts: RunOptions): Promise<void> {
       const full = Date.now() - lastFull > FULL_SCAN_MS
       if (full) lastFull = Date.now()
       const busy = trader?.busyPools() ?? new Set()
-      const free = (c: Candidate) => !backoff.blocked(c.id) && !c.pools.some((id) => busy.has(id))
+      const free = (c: Candidate) => !c.pools.some((id) => busy.has(id) || backoff.blocked(id))
       const screened = market.screen(full ? market.cycles : market.cyclesThrough(touched), (c) => floors.get(c.id))
       const candidates = cycleCandidates(screened, gasPrice(), opts.maxCandidates ?? 24).filter(free)
       for (const [id, c] of payouts) if ((full || touched.has(id)) && free(c)) candidates.push(c)
