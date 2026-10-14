@@ -1,6 +1,6 @@
 {
   "name": "@covennetwork/arb",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Capital-free atomic arbitrage bot and library for Arc: discovers v3/v4 venues, native-USDC pools and fair-launch hook payouts, simulates every route through CovenProbe each block, and sends only what pays for its gas.",
   "license": "MIT",
   "homepage": "https://coven.network",

@@ -91,7 +91,11 @@ export class MarketFeed {
       if (wasUp) this.onNote('websocket dropped; polling until it reconnects')
       setTimeout(() => this.connect(attempt + 1), Math.min(30_000, 1000 * 2 ** attempt))
     }
-    ws.onerror = () => ws.close()
+    // A connection that never opened gets a close event of its own; closing it again from
+    // here makes undici fire another error, recursing until the stack overflows.
+    ws.onerror = () => {
+      if (ws.readyState === WS.OPEN) ws.close()
+    }
   }
 
   private push(logs: Log[]): void {
